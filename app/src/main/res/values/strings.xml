@@ -1,0 +1,67 @@
+<resources>
+    <string name="app_name">CPU TapCheck</string>
+    <string name="brand_subtitle">Central Philippine University</string>
+    <string name="nfc_status_ready">NFC Ready</string>
+    <string name="nfc_status_off">NFC Off</string>
+    <string name="nfc_status_unavailable">No NFC</string>
+
+    <string name="setup_title">Enter Your Student ID</string>
+    <string name="setup_pending_tag_banner">Tag scanned (%1$s). Save your ID to check in.</string>
+    <string name="setup_subtitle">Enter your CPU ID number once. It stays saved only on this phone.</string>
+    <string name="student_id_label">Student ID</string>
+    <string name="student_id_placeholder">e.g. 25-0227-24</string>
+    <string name="student_id_helper">Dashes and spaces are okay. The server matches digits automatically.</string>
+    <string name="student_id_error_empty">Please enter your Student ID number.</string>
+    <string name="student_id_error_digits">Enter at least 4 digits for your Student ID.</string>
+
+    <string name="verify_section_title">Optional: Verify "Is this you?"</string>
+    <string name="verify_section_subtitle">Enter a subject code (like BUS 2101) to check your name on the class roster.</string>
+    <string name="class_code_label">Subject Code</string>
+    <string name="class_code_placeholder">e.g. BUS 2101</string>
+    <string name="verify_button">Look Up My Name</string>
+    <string name="verifying_button">Looking Up...</string>
+    <string name="verify_confirm_title">Is this you?</string>
+    <string name="verify_confirm_yes">Yes, Save My ID</string>
+    <string name="verify_confirm_no">Not Me</string>
+    <string name="save_id_button">Save Student ID</string>
+    <string name="cancel_edit_button">Cancel</string>
+
+    <string name="saved_id_label">Saved Student ID</string>
+    <string name="edit_id_button">Edit ID</string>
+
+    <string name="nfc_off_title">NFC is turned off</string>
+    <string name="nfc_off_body">Turn on NFC in your phone settings to tap classroom attendance cards.</string>
+    <string name="open_nfc_settings">Open NFC Settings</string>
+
+    <string name="nfc_unavailable_title">NFC not available on this device</string>
+    <string name="nfc_unavailable_body">This device does not have an NFC reader. Classroom NFC card check-in requires an Android phone with NFC.</string>
+
+    <string name="ready_title">Ready to Tap</string>
+    <string name="ready_subtitle">Hold the back of your phone near the classroom NFC card to record your attendance.</string>
+    <string name="ready_tip_clock">Date and time are recorded by the server (Asia/Manila).</string>
+    <string name="ready_tip_single">One check-in per class each day. A second tap confirms your first time.</string>
+    <string name="hero_illustration_desc">Student tapping a phone onto a classroom NFC attendance card</string>
+
+    <string name="checking_in_title">Recording Attendance...</string>
+    <string name="checking_in_subtitle">Contacting server for %1$s</string>
+
+    <string name="result_present_title">Present</string>
+    <string name="result_late_title">Late</string>
+    <string name="result_already_title">Already Checked In</string>
+    <string name="result_closed_title">Attendance Closed</string>
+    <string name="result_noclass_title">No Class Today</string>
+    <string name="result_notfound_title">ID Not on Roster</string>
+    <string name="result_offline_title">No Connection</string>
+    <string name="result_offline_message">No connection, tap again.</string>
+    <string name="result_invalid_tag_title">Unrecognized Tag</string>
+    <string name="result_invalid_tag_message">This NFC tag does not contain a valid subject code.</string>
+    <string name="result_error_title">Check-In Issue</string>
+    <string name="result_server_html_message">The server did not return a check-in response. Ask your teacher to check the web app version.</string>
+
+    <string name="result_greeting">Welcome, %1$s</string>
+    <string name="result_first_scan_at">First check-in at %1$s</string>
+    <string name="result_class_code_label">Subject Code: %1$s</string>
+    <string name="done_button">Ready for Next Tap</string>
+    <string name="update_id_action">Update Student ID</string>
+    <string name="retry_hint">Please tap the NFC card again once connected.</string>
+</resources>

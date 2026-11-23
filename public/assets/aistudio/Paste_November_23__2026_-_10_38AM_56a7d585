@@ -1,0 +1,917 @@
+/** @OnlyCurrentDoc */
+
+/**
+ * QR Class Attendance, multi-teacher edition
+ * Google Apps Script web app bound to a Google Sheet with these tabs:
+ *   Settings    (Key, Value)   TimeZone, Threshold, WebAppUrl, Secret (made automatically)
+ *   Teachers    (made automatically on first admin login)
+ *   Classes     (Code, Subject, Days, Start, End, OpenBeforeMin, LateAfterMin, ExtraDates, SkipDates, Owner)
+ *   Roster      (Code, ID, Name, CourseYear)
+ *   Attendance  (Timestamp, Date, Time, Code, ID, Name, Status, Method)
+ *
+ * Students open  <web app URL>?code=<Code>   (what the class QR code contains)
+ * Teachers open  <web app URL>?page=teacher  (log in, manage classes, monitor)
+ */
+
+var DEFAULT_TZ = 'Asia/Manila';
+var DEFAULT_THRESHOLD = 80;
+var DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+var TOKEN_HOURS = 12;
+var MAX_ROSTER = 500;
+var CLASS_HEAD = ['Code', 'Subject', 'Days', 'Start', 'End', 'OpenBeforeMin', 'LateAfterMin', 'ExtraDates', 'SkipDates', 'Owner'];
+var TEACHER_HEAD = ['Username', 'Name', 'Role', 'Salt', 'KeyHash', 'MustChange', 'Active', 'Created'];
+var CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+var KEY_CHARS = 'abcdefghijkmnpqrstuvwxyz23456789';
+
+// ---------------------------------------------------------------- pages
+
+function doGet(e) {
+  var p = (e && e.parameter) || {};
+  var isTeacher = p.page === 'teacher';
+  var t = HtmlService.createTemplateFromFile(isTeacher ? 'Teacher' : 'Student');
+  t.code = String(p.code || '').replace(/[^A-Za-z0-9_-]/g, '');
+  t.baseUrl = isTeacher ? baseUrl_() : '';
+  return t.evaluate()
+    .setTitle(isTeacher ? 'Attendance: Teacher' : 'Class Attendance')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// The public web app link lives in Settings (WebAppUrl); the school-domain form
+// (/a/cpu.edu.ph/...) is converted to the public form because students are not signed in.
+function baseUrl_() {
+  return String(settings_().WebAppUrl || '').trim()
+    .replace(/\/a\/macros\/[^\/]+\/s\//, '/macros/s/')
+    .replace(/\/a\/[^\/]+\/macros\/s\//, '/macros/s/')
+    .replace(/[?#].*$/, '');
+}
+
+// ---------------------------------------------------------------- sheet helpers
+
+function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+
+function sheet_(name) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('Missing sheet: ' + name);
+  return sh;
+}
+
+// Rows as objects keyed by header, text exactly as displayed.
+function table_(name) {
+  var vals = sheet_(name).getDataRange().getDisplayValues();
+  var head = vals.shift().map(function (h) { return String(h).trim(); });
+  var out = [];
+  vals.forEach(function (r) {
+    if (r.join('').trim() === '') return;
+    var o = {};
+    head.forEach(function (h, i) { o[h] = String(r[i] === undefined ? '' : r[i]).trim(); });
+    out.push(o);
+  });
+  return out;
+}
+
+// Header + rows with their sheet row numbers (for edits and deletes).
+function grid_(name) {
+  var vals = sheet_(name).getDataRange().getDisplayValues();
+  var head = vals[0].map(function (h) { return String(h).trim(); });
+  var rows = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (vals[i].join('').trim() === '') continue;
+    var o = { _row: i + 1 };
+    head.forEach(function (h, j) { o[h] = String(vals[i][j] === undefined ? '' : vals[i][j]).trim(); });
+    rows.push(o);
+  }
+  return { head: head, rows: rows };
+}
+
+function toArr_(head, obj) {
+  return head.map(function (h) { return obj[h] === undefined ? '' : String(obj[h]); });
+}
+
+function putRow_(sheetName, head, rowNum, obj) {
+  sheet_(sheetName).getRange(rowNum, 1, 1, head.length).setNumberFormat('@').setValues([toArr_(head, obj)]);
+}
+
+function settings_() {
+  var o = {};
+  table_('Settings').forEach(function (r) { o[r.Key] = r.Value; });
+  return o;
+}
+
+function setSetting_(key, val) {
+  var g = grid_('Settings');
+  for (var i = 0; i < g.rows.length; i++) {
+    if (g.rows[i].Key === key) { putRow_('Settings', g.head, g.rows[i]._row, { Key: key, Value: val }); return; }
+  }
+  var sh = sheet_('Settings');
+  sh.getRange(sh.getLastRow() + 1, 1, 1, 2).setNumberFormat('@').setValues([[key, String(val)]]);
+}
+
+function tz_() { return settings_().TimeZone || DEFAULT_TZ; }
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(25000); } catch (e) { throw new Error('The system is busy. Please try again.'); }
+  try { return fn(); } finally { try { lock.releaseLock(); } catch (e2) { /* not held */ } }
+}
+
+function cache_() { return CacheService.getScriptCache(); }
+
+// ---------------------------------------------------------------- parsing and time
+
+function normId_(s) { return String(s || '').replace(/\D/g, ''); }
+
+function num_(v, dflt) {
+  var n = parseInt(v, 10);
+  return isNaN(n) ? dflt : n;
+}
+
+function parseTime_(s) {
+  var m = String(s).trim().match(/^(\d{1,2}):?(\d{2})(?::\d{2})?\s*([AaPp][Mm])?$/);
+  if (!m) throw new Error('Bad time: ' + s);
+  var h = parseInt(m[1], 10), mi = parseInt(m[2], 10), ap = m[3] && m[3].toLowerCase();
+  if (ap === 'pm' && h < 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  if (h > 23 || mi > 59) throw new Error('Bad time: ' + s);
+  return h * 60 + mi;
+}
+
+function parseDays_(s) {
+  var found = [];
+  var m = String(s).toLowerCase().match(/sun|mon|tue|wed|thu|fri|sat/g) || [];
+  m.forEach(function (d) {
+    var i = DAY_NAMES.indexOf(d);
+    if (found.indexOf(i) < 0) found.push(i);
+  });
+  return found;
+}
+
+function parseDates_(s, tz) {
+  var out = [];
+  String(s || '').split(/[,;\s]+/).forEach(function (tok) {
+    if (!tok) return;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(tok)) { out.push(tok); return; }
+    var d = new Date(tok);
+    if (!isNaN(d.getTime())) out.push(Utilities.formatDate(d, tz, 'yyyy-MM-dd'));
+  });
+  return out;
+}
+
+function to12_(hhmm) {
+  var m = String(hhmm).match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return String(hhmm);
+  var h = parseInt(m[1], 10), ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12; if (h === 0) h = 12;
+  return h + ':' + m[2] + ' ' + ap;
+}
+
+function mins12_(mins) {
+  var h = Math.floor(mins / 60), m = mins % 60;
+  return to12_(h + ':' + (m < 10 ? '0' : '') + m);
+}
+
+function hhmm_(mins) {
+  var h = Math.floor(mins / 60), m = mins % 60;
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+}
+
+function now_(tz) {
+  var d = new Date();
+  var f = function (p) { return Utilities.formatDate(d, tz, p); };
+  return {
+    date: f('yyyy-MM-dd'),
+    time: f('HH:mm:ss'),
+    minutes: parseInt(f('H'), 10) * 60 + parseInt(f('m'), 10),
+    dow: parseInt(f('u'), 10) % 7,          // 0 = Sunday ... 6 = Saturday
+    label: f('EEEE, MMMM d')
+  };
+}
+
+// Is it a class day, is attendance open, and does a scan now count as late?
+function session_(cls, n, tz) {
+  var days = parseDays_(cls.Days);
+  var extra = parseDates_(cls.ExtraDates, tz);
+  var skip = parseDates_(cls.SkipDates, tz);
+  var start = parseTime_(cls.Start), end = parseTime_(cls.End);
+  var openBefore = num_(cls.OpenBeforeMin, 30);
+  var lateAfter = num_(cls.LateAfterMin, 15);
+  var isDay = (days.indexOf(n.dow) >= 0 || extra.indexOf(n.date) >= 0) && skip.indexOf(n.date) < 0;
+  return {
+    isDay: isDay,
+    open: isDay && n.minutes >= start - openBefore && n.minutes <= end,
+    late: n.minutes > start + lateAfter,
+    start: start,
+    end: end
+  };
+}
+
+function scheduleText_(cls) {
+  try {
+    var days = parseDays_(cls.Days).map(function (i) {
+      return DAY_NAMES[i].charAt(0).toUpperCase() + DAY_NAMES[i].slice(1);
+    }).join(', ');
+    return days + ' ' + mins12_(parseTime_(cls.Start)) + ' to ' + mins12_(parseTime_(cls.End));
+  } catch (e) { return ''; }
+}
+
+// ---------------------------------------------------------------- names
+
+function titleCase_(s) {
+  return String(s).toLowerCase().replace(/(^|[\s\-'’.])(\S)/g, function (m, a, b) {
+    return a + b.toUpperCase();
+  });
+}
+
+// "ACOSTA, Princess Dian" -> Princess Dian Acosta. Without a comma the name is used as typed.
+function splitName_(full) {
+  var s = String(full || '').trim().replace(/\s+/g, ' ');
+  var i = s.indexOf(',');
+  if (i < 0) {
+    var whole = titleCase_(s);
+    return { last: whole, given: whole, display: whole, short: shortGiven_(whole) };
+  }
+  var last = titleCase_(s.slice(0, i).trim());
+  var given = s.slice(i + 1).trim();
+  if (!given) given = last;
+  return { last: last, given: given, display: given + ' ' + last, short: shortGiven_(given) };
+}
+
+// Greeting name: drop the middle name when there are 3 or more words.
+function shortGiven_(given) {
+  var w = given.split(/\s+/);
+  if (w.length < 3) return given;
+  w.pop();
+  var particles = ['de', 'del', 'dela', 'la', 'los', 'delos', 'san', 'santa', 'sta', 'sta.', 'da', 'di'];
+  while (w.length > 1 && particles.indexOf(w[w.length - 1].toLowerCase()) >= 0) w.pop();
+  return w.join(' ');
+}
+
+// ---------------------------------------------------------------- classes and roster (cached for scans)
+
+function classes_() {
+  return table_('Classes').map(function (c) { c.Owner = (c.Owner || 'admin').toLowerCase(); return c; });
+}
+
+function getClass_(code) {
+  var rows = classes_();
+  for (var i = 0; i < rows.length; i++) if (rows[i].Code === String(code)) return rows[i];
+  return null;
+}
+
+function bust_(code) { try { cache_().remove('cl_' + code); } catch (e) { /* ignore */ } }
+
+// Class + roster, cached ~2 minutes so a room full of scans does not re-read the sheet.
+function loadClass_(code, fresh) {
+  code = String(code);
+  var key = 'cl_' + code;
+  if (!fresh) {
+    try {
+      var hit = cache_().get(key);
+      if (hit) { var d = JSON.parse(hit); d.cached = true; return d; }
+    } catch (e) { /* fall through to the sheet */ }
+  }
+  var cls = getClass_(code);
+  if (!cls) return null;
+  var d2 = {
+    cls: cls,
+    tz: tz_(),
+    r: table_('Roster').filter(function (r) { return r.Code === code; }).map(function (r) { return [r.ID, r.Name]; }),
+    cached: false
+  };
+  try { cache_().put(key, JSON.stringify(d2), 120); } catch (e) { /* too large or unavailable */ }
+  return d2;
+}
+
+function findIn_(d, idRaw) {
+  var id = normId_(idRaw);
+  if (id.length < 6) return null;
+  for (var i = 0; i < d.r.length; i++) {
+    if (normId_(d.r[i][0]) === id) return { ID: d.r[i][0], Name: d.r[i][1] };
+  }
+  return null;
+}
+
+// Look the student up; if the cached roster has not got them, re-read the sheet once.
+function resolve_(code, idRaw) {
+  var d = loadClass_(code, false);
+  if (!d) return { d: null, st: null };
+  var st = findIn_(d, idRaw);
+  if (!st && d.cached) { d = loadClass_(code, true); st = findIn_(d, idRaw); }
+  return { d: d, st: st };
+}
+
+// ---------------------------------------------------------------- student API
+
+function apiLookup(code, idRaw) {
+  try {
+    var r = resolve_(code, idRaw);
+    if (!r.d) return { ok: false, msg: 'This QR code is not linked to a class. Please ask your teacher.' };
+    if (!r.st) return { ok: false, msg: 'That ID number is not on the class list for ' + r.d.cls.Subject + '. Please check it and try again.' };
+    var nm = splitName_(r.st.Name);
+    return { ok: true, display: nm.display, given: nm.given, subject: r.d.cls.Subject };
+  } catch (err) {
+    console.error(err);
+    return { ok: false, msg: 'Something went wrong. Please try again.' };
+  }
+}
+
+function apiCheckIn(code, idRaw) {
+  try {
+    return checkIn_(code, idRaw, {});
+  } catch (err) {
+    console.error(err);
+    return { ok: false, state: 'error', msg: 'The system is busy. Please tap Try again.' };
+  }
+}
+
+// opts.manual: teacher override (ignores the open window). opts.now: for tests.
+function checkIn_(code, idRaw, opts) {
+  var r = resolve_(code, idRaw);
+  if (!r.d) return { ok: false, state: 'noclass', msg: 'This QR code is not linked to a class. Please ask your teacher.' };
+  var cls = r.d.cls;
+  if (!r.st) return { ok: false, state: 'notfound', msg: 'That ID number is not on the class list for ' + cls.Subject + '.' };
+  var st = r.st, tz = r.d.tz;
+
+  var n = opts.now || now_(tz);
+  var s = session_(cls, n, tz);
+  var nm = splitName_(st.Name);
+  var base = { ok: true, given: nm.short, display: nm.display, subject: cls.Subject, dateLabel: n.label };
+
+  if (!opts.manual && !s.open) {
+    base.ok = false;
+    base.state = 'closed';
+    base.msg = s.isDay
+      ? 'Attendance is open from ' + mins12_(s.start - num_(cls.OpenBeforeMin, 30)) + ' to ' + mins12_(s.end) + '.'
+      : 'There is no class scheduled today.';
+    base.schedule = cls.Subject + ': ' + scheduleText_(cls);
+    return base;
+  }
+
+  var id = normId_(st.ID);
+  var status = opts.manual ? 'Present' : (s.late ? 'Late' : 'Present');
+
+  // Only the duplicate check and the append are inside the lock, and only recent rows are read.
+  var prior = withLock_(function () {
+    var sh = sheet_('Attendance');
+    var last = sh.getLastRow();
+    if (last >= 2) {
+      var from = Math.max(2, last - 1499);
+      var vals = sh.getRange(from, 1, last - from + 1, 8).getDisplayValues();
+      for (var i = 0; i < vals.length; i++) {
+        var v = vals[i];
+        if (String(v[1]).trim() === n.date && String(v[3]).trim() === String(code) && normId_(v[4]) === id) {
+          return { Status: String(v[6]).trim(), Time: String(v[2]).trim() };
+        }
+      }
+    }
+    sh.getRange(last + 1, 1, 1, 8).setNumberFormat('@').setValues([[
+      n.date + ' ' + n.time, n.date, n.time, String(code), st.ID, st.Name, status, opts.manual ? 'Manual' : 'QR'
+    ]]);
+    return null;
+  });
+
+  if (prior) {
+    base.already = true;
+    base.status = prior.Status;
+    base.time = to12_(prior.Time);
+    return base;
+  }
+  base.already = false;
+  base.status = status;
+  base.time = to12_(n.time);
+  return base;
+}
+
+// ---------------------------------------------------------------- accounts
+
+function hex_(bytes) {
+  return bytes.map(function (b) {
+    var h = (b < 0 ? b + 256 : b).toString(16);
+    return h.length < 2 ? '0' + h : h;
+  }).join('');
+}
+
+function hash_(salt, key) {
+  return hex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + '|' + key, Utilities.Charset.UTF_8));
+}
+
+function randStr_(chars, n) {
+  var s = '';
+  for (var i = 0; i < n; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+  return s;
+}
+
+function newSalt_() { return randStr_('0123456789abcdef', 16) + 's'; }
+
+function getSecret_() {
+  var s = settings_().Secret;
+  if (!s) { s = Utilities.getUuid() + Utilities.getUuid(); setSetting_('Secret', s); }
+  return s;
+}
+
+function sign_(msg) {
+  return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(msg, getSecret_()));
+}
+
+function mint_(t) {
+  var exp = Date.now() + TOKEN_HOURS * 3600 * 1000;
+  var body = t.Username + '~' + exp + '~' + t.KeyHash.slice(0, 10);
+  return t.Username + '~' + exp + '~' + sign_(body);
+}
+
+function teachers_() { return grid_('Teachers').rows; }
+
+function findTeacher_(username) {
+  var rows = teachers_();
+  for (var i = 0; i < rows.length; i++) if (rows[i].Username === username) return rows[i];
+  return null;
+}
+
+function pub_(t) {
+  return { username: t.Username, name: t.Name, role: t.Role, mustChange: t.MustChange === 'yes' };
+}
+
+// First use: the old single TeacherKey becomes the key of the admin account.
+function ensureTeachers_() {
+  if (ss_().getSheetByName('Teachers')) return '';
+  return withLock_(function () {
+    if (ss_().getSheetByName('Teachers')) return '';
+    var k = String(settings_().TeacherKey || '');
+    if (!k || k.toUpperCase() === 'CHANGE-ME' || k === 'MIGRATED') {
+      return 'First-time setup: type your old TeacherKey (or any key you like) in the Settings sheet, then log in as admin with it.';
+    }
+    var sh = ss_().insertSheet('Teachers');
+    var salt = newSalt_();
+    var admin = { Username: 'admin', Name: 'Admin', Role: 'admin', Salt: salt, KeyHash: hash_(salt, k),
+                  MustChange: 'yes', Active: 'yes', Created: now_(tz_()).date };
+    sh.getRange(1, 1, 2, TEACHER_HEAD.length).setNumberFormat('@').setValues([TEACHER_HEAD, toArr_(TEACHER_HEAD, admin)]);
+    ensureOwnerCol_();
+    getSecret_();
+    setSetting_('TeacherKey', 'MIGRATED');
+    return '';
+  });
+}
+
+// Existing classes belong to admin.
+function ensureOwnerCol_() {
+  var g = grid_('Classes');
+  if (g.head.indexOf('Owner') >= 0) return;
+  var sh = sheet_('Classes');
+  var col = g.head.length + 1;
+  sh.getRange(1, col).setNumberFormat('@').setValue('Owner');
+  g.rows.forEach(function (r) { sh.getRange(r._row, col).setNumberFormat('@').setValue('admin'); });
+}
+
+function failKey_(u) { return 'lf_' + String(u).slice(0, 40); }
+
+function apiLogin(username, key) {
+  try {
+    username = String(username || '').trim().toLowerCase();
+    key = String(key || '');
+    if (!username || !key) return { ok: false, msg: 'Enter your username and key.' };
+    var boot = ensureTeachers_();
+    if (boot) return { ok: false, msg: boot };
+    var c = cache_(), fk = failKey_(username);
+    if (num_(c.get(fk), 0) >= 6) return { ok: false, msg: 'Too many wrong tries. Please wait 15 minutes and try again.' };
+    var t = findTeacher_(username);
+    if (!t || t.Active !== 'yes' || hash_(t.Salt, key) !== t.KeyHash) {
+      c.put(fk, String(num_(c.get(fk), 0) + 1), 900);
+      return { ok: false, msg: 'Wrong username or key.' };
+    }
+    c.remove(fk);
+    return { ok: true, token: mint_(t), user: pub_(t) };
+  } catch (err) {
+    console.error(err);
+    return { ok: false, msg: 'Something went wrong: ' + (err && err.message ? err.message : err) };
+  }
+}
+
+// Returns {ok:true,u:teacherRow} or {ok:false,auth:true,msg}
+function authz_(token, allowMust) {
+  var bad = { ok: false, auth: true, msg: 'Please log in again.' };
+  var p = String(token || '').split('~');
+  if (p.length !== 3) return bad;
+  if (!ss_().getSheetByName('Teachers')) return bad;
+  var exp = parseInt(p[1], 10);
+  if (isNaN(exp) || exp < Date.now()) return bad;
+  var t = findTeacher_(p[0]);
+  if (!t || t.Active !== 'yes') return bad;
+  if (sign_(p[0] + '~' + p[1] + '~' + t.KeyHash.slice(0, 10)) !== p[2]) return bad;
+  if (t.MustChange === 'yes' && !allowMust) return { ok: false, mustChange: true, msg: 'Please set your own key first.' };
+  return { ok: true, u: t };
+}
+
+// opts: admin (admin only), allowMust, write (run inside the script lock)
+function guard_(token, opts, fn) {
+  opts = opts || {};
+  try {
+    var a = authz_(token, opts.allowMust);
+    if (!a.ok) return a;
+    if (opts.admin && a.u.Role !== 'admin') return { ok: false, msg: 'Only the admin can do that.' };
+    return opts.write ? withLock_(function () { return fn(a.u); }) : fn(a.u);
+  } catch (err) {
+    console.error(err);
+    return { ok: false, msg: err && err.message ? err.message : 'Something went wrong.' };
+  }
+}
+
+function classFor_(u, code) {
+  var c = getClass_(code);
+  if (!c) return null;
+  return (u.Role === 'admin' || c.Owner === u.Username) ? c : null;
+}
+
+function classOut_(c, teachersByName, counts) {
+  var tz = DEFAULT_TZ;
+  return {
+    code: c.Code, subject: c.Subject, schedule: scheduleText_(c),
+    owner: c.Owner, ownerName: (teachersByName[c.Owner] || c.Owner),
+    students: counts[c.Code] || 0,
+    days: c.Days, start: c.Start, end: c.End,
+    openBefore: num_(c.OpenBeforeMin, 30), lateAfter: num_(c.LateAfterMin, 15),
+    extra: c.ExtraDates, skip: c.SkipDates
+  };
+}
+
+function classList_(u) {
+  var names = {};
+  teachers_().forEach(function (t) { names[t.Username] = t.Name; });
+  var counts = {};
+  table_('Roster').forEach(function (r) { counts[r.Code] = (counts[r.Code] || 0) + 1; });
+  return classes_()
+    .filter(function (c) { return u.Role === 'admin' || c.Owner === u.Username; })
+    .map(function (c) { return classOut_(c, names, counts); });
+}
+
+function apiInit(token) {
+  return guard_(token, { allowMust: true }, function (u) {
+    var out = { ok: true, user: pub_(u), baseUrl: baseUrl_(), threshold: num_(settings_().Threshold, DEFAULT_THRESHOLD) };
+    if (u.MustChange !== 'yes') out.classes = classList_(u);
+    return out;
+  });
+}
+
+function apiClasses(token) {
+  return guard_(token, {}, function (u) { return { ok: true, classes: classList_(u) }; });
+}
+
+function apiChangeKey(token, oldKey, newKey) {
+  return guard_(token, { allowMust: true, write: true }, function (u) {
+    newKey = String(newKey || '');
+    if (newKey.length < 6) return { ok: false, msg: 'Your new key must be at least 6 characters.' };
+    if (hash_(u.Salt, String(oldKey || '')) !== u.KeyHash) return { ok: false, msg: 'Your current key is not right.' };
+    if (newKey === String(oldKey)) return { ok: false, msg: 'Choose a different key from the current one.' };
+    var salt = newSalt_();
+    u.Salt = salt; u.KeyHash = hash_(salt, newKey); u.MustChange = 'no';
+    putRow_('Teachers', TEACHER_HEAD, u._row, u);
+    return { ok: true, token: mint_(u), user: pub_(u) };
+  });
+}
+
+// ---------------------------------------------------------------- class management
+
+function cleanInfo_(info, tz) {
+  info = info || {};
+  var subject = String(info.subject || '').trim().replace(/\s+/g, ' ');
+  if (!subject) throw new Error('Please enter the subject name.');
+  if (subject.length > 120) throw new Error('The subject name is too long.');
+  var days = parseDays_(info.days || '');
+  if (!days.length) throw new Error('Choose at least one class day.');
+  days.sort(function (a, b) { return a - b; });
+  var s, e;
+  try { s = parseTime_(info.start); e = parseTime_(info.end); } catch (x) { throw new Error('Please enter the start and end time.'); }
+  if (e <= s) throw new Error('The end time must be after the start time.');
+  var ob = num_(info.openBefore, 30), la = num_(info.lateAfter, 15);
+  if (ob < 0 || ob > 180) throw new Error('"Open before" must be between 0 and 180 minutes.');
+  if (la < 0 || la > 180) throw new Error('"Late after" must be between 0 and 180 minutes.');
+  function dates(label, v) {
+    var toks = String(v || '').split(/[,;\s]+/).filter(Boolean);
+    toks.forEach(function (t) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) throw new Error(label + ': write dates like 2026-12-08, separated by commas.');
+    });
+    return toks.join(', ');
+  }
+  return {
+    Subject: subject,
+    Days: days.map(function (i) { return DAY_NAMES[i].charAt(0).toUpperCase() + DAY_NAMES[i].slice(1); }).join(', '),
+    Start: hhmm_(s), End: hhmm_(e),
+    OpenBeforeMin: String(ob), LateAfterMin: String(la),
+    ExtraDates: dates('Extra dates', info.extra), SkipDates: dates('Skip dates', info.skip)
+  };
+}
+
+function cleanRoster_(rows, existing) {
+  var seen = {};
+  (existing || []).forEach(function (id) { seen[normId_(id)] = true; });
+  var good = [], skipped = [];
+  (rows || []).forEach(function (r, i) {
+    var id = String(r && r.id !== undefined ? r.id : '').trim().slice(0, 30);
+    var name = String(r && r.name !== undefined ? r.name : '').trim().replace(/\s+/g, ' ').slice(0, 100);
+    var course = String(r && r.course !== undefined ? r.course : '').trim().slice(0, 40);
+    var n = normId_(id);
+    if (!id && !name) return;
+    if (n.length < 6) { skipped.push((name || id) + ': ID number looks wrong'); return; }
+    if (!name) { skipped.push(id + ': no name'); return; }
+    if (seen[n]) { skipped.push(name + ': already on the list'); return; }
+    seen[n] = true;
+    good.push({ ID: id, Name: name, CourseYear: course });
+  });
+  return { good: good, skipped: skipped };
+}
+
+function appendRoster_(code, good) {
+  if (!good.length) return;
+  var g = grid_('Roster');
+  var sh = sheet_('Roster');
+  var data = good.map(function (r) {
+    return toArr_(g.head, { Code: code, ID: r.ID, Name: r.Name, CourseYear: r.CourseYear });
+  });
+  sh.getRange(sh.getLastRow() + 1, 1, data.length, g.head.length).setNumberFormat('@').setValues(data);
+}
+
+function newCode_() {
+  var used = {};
+  classes_().forEach(function (c) { used[c.Code] = true; });
+  for (var k = 0; k < 50; k++) {
+    var c = randStr_(CODE_CHARS, 6);
+    if (!used[c]) return c;
+  }
+  throw new Error('Could not make a class code. Please try again.');
+}
+
+function apiAddClass(token, info, rows) {
+  return guard_(token, { write: true }, function (u) {
+    var tz = tz_();
+    var clean = cleanInfo_(info, tz);
+    var owner = u.Username;
+    if (u.Role === 'admin' && info && info.owner) {
+      var t = findTeacher_(String(info.owner).toLowerCase());
+      if (!t || t.Active !== 'yes') return { ok: false, msg: 'That teacher was not found.' };
+      owner = t.Username;
+    }
+    var r = cleanRoster_(rows, []);
+    if (!r.good.length) return { ok: false, msg: 'No valid students were found in the list. Check the ID numbers and names.' };
+    if (r.good.length > MAX_ROSTER) return { ok: false, msg: 'A class can have at most ' + MAX_ROSTER + ' students.' };
+    ensureOwnerCol_();
+    var g = grid_('Classes');
+    var code = newCode_();
+    clean.Code = code; clean.Owner = owner;
+    var sh = sheet_('Classes');
+    sh.getRange(sh.getLastRow() + 1, 1, 1, g.head.length).setNumberFormat('@').setValues([toArr_(g.head, clean)]);
+    appendRoster_(code, r.good);
+    bust_(code);
+    return { ok: true, code: code, added: r.good.length, skipped: r.skipped };
+  });
+}
+
+function apiUpdateClass(token, code, info) {
+  return guard_(token, { write: true }, function (u) {
+    var c = classFor_(u, code);
+    if (!c) return { ok: false, msg: 'Class not found.' };
+    var clean = cleanInfo_(info, tz_());
+    var g = grid_('Classes');
+    var row = null;
+    g.rows.forEach(function (r) { if (r.Code === String(code)) row = r; });
+    if (!row) return { ok: false, msg: 'Class not found.' };
+    Object.keys(clean).forEach(function (k) { row[k] = clean[k]; });
+    if (u.Role === 'admin' && info && info.owner) {
+      var t = findTeacher_(String(info.owner).toLowerCase());
+      if (!t || t.Active !== 'yes') return { ok: false, msg: 'That teacher was not found.' };
+      row.Owner = t.Username;
+    }
+    putRow_('Classes', g.head, row._row, row);
+    bust_(code);
+    return { ok: true };
+  });
+}
+
+function apiDeleteClass(token, code, confirmCode) {
+  return guard_(token, { write: true }, function (u) {
+    var c = classFor_(u, code);
+    if (!c) return { ok: false, msg: 'Class not found.' };
+    if (String(confirmCode || '') !== String(code)) return { ok: false, msg: 'Type the class code to confirm.' };
+    var rg = grid_('Roster');
+    var rosterRows = rg.rows.filter(function (r) { return r.Code === String(code); })
+      .map(function (r) { return r._row; }).sort(function (a, b) { return b - a; });
+    var rsh = sheet_('Roster');
+    rosterRows.forEach(function (n) { rsh.deleteRow(n); });
+    var cg = grid_('Classes');
+    cg.rows.forEach(function (r) { if (r.Code === String(code)) sheet_('Classes').deleteRow(r._row); });
+    bust_(code);
+    return { ok: true, removedStudents: rosterRows.length };
+  });
+}
+
+function apiRoster(token, code) {
+  return guard_(token, {}, function (u) {
+    if (!classFor_(u, code)) return { ok: false, msg: 'Class not found.' };
+    var rows = table_('Roster').filter(function (r) { return r.Code === String(code); })
+      .map(function (r) { return { id: r.ID, name: r.Name, course: r.CourseYear }; })
+      .sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    return { ok: true, rows: rows };
+  });
+}
+
+function apiRosterAdd(token, code, rows) {
+  return guard_(token, { write: true }, function (u) {
+    if (!classFor_(u, code)) return { ok: false, msg: 'Class not found.' };
+    var have = table_('Roster').filter(function (r) { return r.Code === String(code); });
+    var r = cleanRoster_(rows, have.map(function (x) { return x.ID; }));
+    if (have.length + r.good.length > MAX_ROSTER) return { ok: false, msg: 'A class can have at most ' + MAX_ROSTER + ' students.' };
+    appendRoster_(String(code), r.good);
+    bust_(code);
+    return { ok: true, added: r.good.length, skipped: r.skipped };
+  });
+}
+
+function apiRosterRemove(token, code, idRaw) {
+  return guard_(token, { write: true }, function (u) {
+    if (!classFor_(u, code)) return { ok: false, msg: 'Class not found.' };
+    var id = normId_(idRaw);
+    var rg = grid_('Roster');
+    var rows = rg.rows.filter(function (r) { return r.Code === String(code) && normId_(r.ID) === id; })
+      .map(function (r) { return r._row; }).sort(function (a, b) { return b - a; });
+    if (!rows.length) return { ok: false, msg: 'Student not found.' };
+    rows.forEach(function (n) { sheet_('Roster').deleteRow(n); });
+    bust_(code);
+    return { ok: true };
+  });
+}
+
+// ---------------------------------------------------------------- monitoring
+
+function apiToday(token, code) {
+  return guard_(token, {}, function (u) {
+    var cls = classFor_(u, code);
+    if (!cls) return { ok: false, msg: 'Class not found.' };
+    var tz = tz_();
+    var n = now_(tz);
+    var s = session_(cls, n, tz);
+    var roster = table_('Roster').filter(function (r) { return r.Code === String(code); });
+    var att = table_('Attendance').filter(function (r) { return r.Code === String(code) && r.Date === n.date; });
+
+    var seen = {};
+    var present = att.map(function (r) {
+      seen[normId_(r.ID)] = true;
+      return { id: r.ID, name: r.Name, time: to12_(r.Time), status: r.Status, method: r.Method, sort: r.Time };
+    }).sort(function (a, b) { return a.sort < b.sort ? -1 : 1; });
+    var absent = roster.filter(function (r) { return !seen[normId_(r.ID)]; })
+      .map(function (r) { return { id: r.ID, name: r.Name }; });
+
+    return {
+      ok: true, subject: cls.Subject, dateLabel: n.label, isDay: s.isDay, open: s.open,
+      present: present, absent: absent,
+      counts: {
+        total: roster.length,
+        present: present.filter(function (p) { return p.status === 'Present'; }).length,
+        late: present.filter(function (p) { return p.status === 'Late'; }).length,
+        absent: absent.length
+      }
+    };
+  });
+}
+
+function apiTotals(token, code) {
+  return guard_(token, {}, function (u) {
+    var cls = classFor_(u, code);
+    if (!cls) return { ok: false, msg: 'Class not found.' };
+    var threshold = num_(settings_().Threshold, DEFAULT_THRESHOLD);
+    var roster = table_('Roster').filter(function (r) { return r.Code === String(code); });
+    var att = table_('Attendance').filter(function (r) { return r.Code === String(code); });
+    var dates = {}, perId = {};
+    att.forEach(function (r) {
+      dates[r.Date] = true;
+      var id = normId_(r.ID);
+      (perId[id] = perId[id] || {})[r.Date] = true;
+    });
+    var held = Object.keys(dates).length;
+    var rows = roster.map(function (r) {
+      var got = Object.keys(perId[normId_(r.ID)] || {}).length;
+      return { id: r.ID, name: r.Name, attended: got, pct: held ? Math.round(got * 1000 / held) / 10 : null };
+    });
+    return { ok: true, held: held, threshold: threshold, rows: rows };
+  });
+}
+
+
+// Full report: every student against every meeting date (for the Excel download).
+function apiReport(token, code) {
+  return guard_(token, {}, function (u) {
+    var cls = classFor_(u, code);
+    if (!cls) return { ok: false, msg: 'Class not found.' };
+    var roster = table_('Roster').filter(function (r) { return r.Code === String(code); });
+    var att = table_('Attendance').filter(function (r) { return r.Code === String(code); });
+    var dset = {}, per = {};
+    att.forEach(function (r) {
+      dset[r.Date] = true;
+      var id = normId_(r.ID);
+      (per[id] = per[id] || {})[r.Date] = r.Status;
+    });
+    var dates = Object.keys(dset).sort();
+    var th = num_(settings_().Threshold, DEFAULT_THRESHOLD);
+    var rows = roster.map(function (r) {
+      var m = per[normId_(r.ID)] || {};
+      var marks = dates.map(function (d) { return m[d] === 'Late' ? 'L' : (m[d] ? 'P' : ''); });
+      var got = marks.filter(function (x) { return x; }).length;
+      return { id: r.ID, name: r.Name, course: r.CourseYear, marks: marks, attended: got,
+               late: marks.filter(function (x) { return x === 'L'; }).length,
+               pct: dates.length ? Math.round(got * 1000 / dates.length) / 10 : null };
+    }).sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    return { ok: true, subject: cls.Subject, schedule: scheduleText_(cls), code: cls.Code, threshold: th, dates: dates, rows: rows };
+  });
+}
+
+function apiManualMark(token, code, idRaw) {
+  return guard_(token, {}, function (u) {
+    if (!classFor_(u, code)) return { ok: false, msg: 'Class not found.' };
+    return checkIn_(code, idRaw, { manual: true });
+  });
+}
+
+// ---------------------------------------------------------------- admin
+
+function tempKey_() { return randStr_(KEY_CHARS, 8); }
+
+function apiTeachers(token) {
+  return guard_(token, { admin: true }, function (u) {
+    var counts = {};
+    classes_().forEach(function (c) { counts[c.Owner] = (counts[c.Owner] || 0) + 1; });
+    return {
+      ok: true,
+      teachers: teachers_().map(function (t) {
+        return { username: t.Username, name: t.Name, role: t.Role, active: t.Active === 'yes',
+                 mustChange: t.MustChange === 'yes', classes: counts[t.Username] || 0, created: t.Created };
+      })
+    };
+  });
+}
+
+function apiAddTeacher(token, username, name) {
+  return guard_(token, { admin: true, write: true }, function (u) {
+    username = String(username || '').trim().toLowerCase();
+    name = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!/^[a-z0-9][a-z0-9._-]{2,24}$/.test(username)) {
+      return { ok: false, msg: 'Username: 3 to 25 letters or numbers (no spaces), for example maria.santos' };
+    }
+    if (!name) return { ok: false, msg: 'Please enter the teacher\'s name.' };
+    if (findTeacher_(username)) return { ok: false, msg: 'That username is already taken.' };
+    var key = tempKey_(), salt = newSalt_();
+    var row = { Username: username, Name: name, Role: 'teacher', Salt: salt, KeyHash: hash_(salt, key),
+                MustChange: 'yes', Active: 'yes', Created: now_(tz_()).date };
+    var sh = sheet_('Teachers');
+    sh.getRange(sh.getLastRow() + 1, 1, 1, TEACHER_HEAD.length).setNumberFormat('@').setValues([toArr_(TEACHER_HEAD, row)]);
+    return { ok: true, username: username, name: name, tempKey: key };
+  });
+}
+
+function apiResetKey(token, username) {
+  return guard_(token, { admin: true, write: true }, function (u) {
+    var t = findTeacher_(String(username || '').toLowerCase());
+    if (!t) return { ok: false, msg: 'Teacher not found.' };
+    var key = tempKey_(), salt = newSalt_();
+    t.Salt = salt; t.KeyHash = hash_(salt, key); t.MustChange = 'yes';
+    putRow_('Teachers', TEACHER_HEAD, t._row, t);
+    return { ok: true, username: t.Username, name: t.Name, tempKey: key };
+  });
+}
+
+function apiSetActive(token, username, active) {
+  return guard_(token, { admin: true, write: true }, function (u) {
+    var t = findTeacher_(String(username || '').toLowerCase());
+    if (!t) return { ok: false, msg: 'Teacher not found.' };
+    if (t.Username === u.Username) return { ok: false, msg: 'You cannot turn off your own account.' };
+    t.Active = active ? 'yes' : 'no';
+    putRow_('Teachers', TEACHER_HEAD, t._row, t);
+    return { ok: true };
+  });
+}
+
+function apiRenameTeacher(token, username, name) {
+  return guard_(token, { admin: true, write: true }, function (u) {
+    var t = findTeacher_(String(username || '').toLowerCase());
+    name = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!t || !name) return { ok: false, msg: 'Please enter a name.' };
+    t.Name = name;
+    putRow_('Teachers', TEACHER_HEAD, t._row, t);
+    return { ok: true };
+  });
+}
+
+function apiGetSettings(token) {
+  return guard_(token, { admin: true }, function (u) {
+    var s = settings_();
+    return { ok: true, threshold: num_(s.Threshold, DEFAULT_THRESHOLD), webAppUrl: s.WebAppUrl || '' };
+  });
+}
+
+function apiSaveSettings(token, threshold, webAppUrl) {
+  return guard_(token, { admin: true, write: true }, function (u) {
+    var th = num_(threshold, NaN);
+    if (isNaN(th) || th < 1 || th > 100) return { ok: false, msg: 'Attendance requirement must be between 1 and 100.' };
+    var url = String(webAppUrl || '').trim();
+    if (url && !/^https:\/\/script\.google\.com\//.test(url)) return { ok: false, msg: 'The web app link must start with https://script.google.com/' };
+    setSetting_('Threshold', String(th));
+    setSetting_('WebAppUrl', url);
+    return { ok: true, baseUrl: baseUrl_() };
+  });
+}
