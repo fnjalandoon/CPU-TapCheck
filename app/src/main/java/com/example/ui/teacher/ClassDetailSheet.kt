@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
@@ -19,7 +18,6 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Nfc
 import androidx.compose.material.icons.filled.PersonAdd
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -46,7 +44,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -78,6 +75,10 @@ fun ClassDetailSheet(
     onBack: () -> Unit,
     onSelectTab: (ClassDetailTab) -> Unit,
     onRefreshToday: () -> Unit,
+    onSelectTodayDate: (String) -> Unit,
+    onResetTodayToCurrent: () -> Unit,
+    onStepTodayOlder: () -> Unit,
+    onStepTodayNewer: () -> Unit,
     onManualMark: (String) -> Unit,
     onRefreshRoster: () -> Unit,
     onAddStudents: (List<RosterRowPayload>) -> Unit,
@@ -180,6 +181,10 @@ fun ClassDetailSheet(
             ClassDetailTab.Today -> TodayTabContent(
                 uiState = uiState,
                 onRefresh = onRefreshToday,
+                onSelectDate = onSelectTodayDate,
+                onResetToToday = onResetTodayToCurrent,
+                onStepOlder = onStepTodayOlder,
+                onStepNewer = onStepTodayNewer,
                 onManualMark = onManualMark
             )
             ClassDetailTab.Roster -> RosterTabContent(
@@ -203,197 +208,6 @@ fun ClassDetailSheet(
                     }
                 },
                 onArmWriter = onArmWriter
-            )
-        }
-    }
-}
-
-@Composable
-private fun TodayTabContent(
-    uiState: TeacherUiState,
-    onRefresh: () -> Unit,
-    onManualMark: (String) -> Unit
-) {
-    val today = uiState.todayData
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = today?.dateLabel?.ifBlank { "Today" } ?: "Today",
-                style = MaterialTheme.typography.titleMedium
-            )
-            OutlinedButton(
-                onClick = onRefresh,
-                modifier = Modifier.heightIn(min = 44.dp)
-            ) {
-                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Refresh")
-            }
-        }
-
-        if (uiState.isLoadingToday) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 32.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator()
-            }
-        } else if (!uiState.todayError.isNullOrBlank()) {
-            Surface(
-                color = MaterialTheme.colorScheme.errorContainer,
-                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                shape = MaterialTheme.shapes.small,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    text = uiState.todayError,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(14.dp)
-                )
-            }
-        } else if (today != null) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                CountStatChip("Present", today.counts.present, PresentContainer, OnPresentContainer, Modifier.weight(1f))
-                CountStatChip("Late", today.counts.late, LateContainer, OnLateContainer, Modifier.weight(1f))
-                CountStatChip("Absent", today.counts.absent, MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant, Modifier.weight(1f))
-            }
-
-            if (today.present.isNotEmpty()) {
-                Card(
-                    shape = MaterialTheme.shapes.medium,
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "Checked In (${today.present.size})",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        today.present.forEachIndexed { idx, row ->
-                            if (idx > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(row.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-                                    Text(
-                                        text = "${row.id} | ${row.time} (${row.method})",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                val isLate = row.status.equals("Late", ignoreCase = true)
-                                Surface(
-                                    color = if (isLate) LateContainer else PresentContainer,
-                                    contentColor = if (isLate) OnLateContainer else OnPresentContainer,
-                                    shape = MaterialTheme.shapes.small
-                                ) {
-                                    Text(
-                                        text = row.status,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (today.absent.isNotEmpty()) {
-                Card(
-                    shape = MaterialTheme.shapes.medium,
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "Not Checked In (${today.absent.size})",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        today.absent.forEachIndexed { idx, row ->
-                            if (idx > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(row.name, style = MaterialTheme.typography.bodyLarge)
-                                    Text(
-                                        text = row.id,
-                                        style = MaterialTheme.typography.bodyMedium.copy(
-                                            fontFamily = JetBrainsMonoFontFamily
-                                        ),
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                val isMarking = uiState.markingStudentId == row.id
-                                OutlinedButton(
-                                    onClick = { onManualMark(row.id) },
-                                    enabled = uiState.markingStudentId == null,
-                                    modifier = Modifier.heightIn(min = 44.dp)
-                                ) {
-                                    if (isMarking) {
-                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                    } else {
-                                        Text("Mark Present")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CountStatChip(
-    label: String,
-    value: Int,
-    containerColor: Color,
-    textColor: Color,
-    modifier: Modifier = Modifier
-) {
-    Surface(
-        color = containerColor,
-        contentColor = textColor,
-        shape = MaterialTheme.shapes.medium,
-        modifier = modifier
-    ) {
-        Column(
-            modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = value.toString(),
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium
             )
         }
     }

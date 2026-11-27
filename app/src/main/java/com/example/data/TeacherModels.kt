@@ -131,12 +131,29 @@ data class TodayResponse(
     val ok: Boolean = false,
     val auth: Boolean = false,
     val subject: String = "",
+    val date: String = "",
+    val today: String = "",
     val dateLabel: String = "",
     val isDay: Boolean = false,
     val open: Boolean = false,
+    val isPast: Boolean? = null,
+    val isToday: Boolean? = null,
+    val dates: List<String> = emptyList(),
+    val recordedDates: List<String> = emptyList(),
     val present: List<TodayPresentRow> = emptyList(),
     val absent: List<TodayAbsentRow> = emptyList(),
     val counts: TodayCounts = TodayCounts(),
+    val msg: String? = null
+) {
+    val resolvedDates: List<String>
+        get() = (dates.ifEmpty { recordedDates }).distinct().sortedDescending()
+}
+
+@JsonClass(generateAdapter = true)
+data class ReportDatesResponse(
+    val ok: Boolean = false,
+    val auth: Boolean = false,
+    val dates: List<String> = emptyList(),
     val msg: String? = null
 )
 
@@ -215,7 +232,8 @@ data class PostChangeKeyRequest(
 data class PostClassCodeRequest(
     val action: String,
     val token: String,
-    val code: String
+    val code: String,
+    val date: String? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -239,7 +257,8 @@ data class PostManualMarkRequest(
     val action: String = "manualMark",
     val token: String,
     val code: String,
-    val id: String
+    val id: String,
+    val date: String? = null
 )
 
 @JsonClass(generateAdapter = true)

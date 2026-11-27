@@ -27,6 +27,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 enum class TeacherTab {
     Classes,
@@ -54,6 +58,8 @@ data class TeacherUiState(
     val selectedClass: ClassSummary? = null,
     val classDetailTab: ClassDetailTab = ClassDetailTab.Today,
     val isLoadingToday: Boolean = false,
+    val selectedTodayDate: String = "",
+    val recordedClassDates: List<String> = emptyList(),
     val todayData: TodayResponse? = null,
     val todayError: String? = null,
     val markingStudentId: String? = null,
@@ -274,8 +280,11 @@ class TeacherViewModel(
             it.copy(
                 selectedClass = cls,
                 classDetailTab = ClassDetailTab.Today,
+                selectedTodayDate = "",
+                recordedClassDates = emptyList(),
                 todayData = null,
                 todayError = null,
+                markingStudentId = null,
                 rosterRows = emptyList(),
                 rosterError = null,
                 rosterBanner = null,
@@ -286,7 +295,7 @@ class TeacherViewModel(
                 nfcWriteResult = null
             )
         }
-        loadToday(cls.code)
+        loadToday(cls.code, "")
     }
 
     fun closeClassDetail() {
@@ -309,19 +318,74 @@ class TeacherViewModel(
             )
         }
         when (tab) {
-            ClassDetailTab.Today -> loadToday(cls.code)
+            ClassDetailTab.Today -> loadToday(cls.code, _uiState.value.selectedTodayDate)
             ClassDetailTab.Roster -> loadRoster(cls.code)
             ClassDetailTab.Totals -> loadTotals(cls.code)
             ClassDetailTab.WriteNfc -> Unit
         }
     }
 
-    fun loadToday(code: String) {
+    fun selectTodayDate(dateStr: String) {
+        val cls = _uiState.value.selectedClass ?: return
+        val normalized = dateStr.trim()
+        val manilaToday = _uiState.value.todayData?.today?.takeIf { it.isNotBlank() } ?: manilaTodayKey()
+        val target = if (normalized == manilaToday) "" else normalized
+        loadToday(cls.code, target)
+    }
+
+    fun resetTodayToCurrent() {
+        val cls = _uiState.value.selectedClass ?: return
+        loadToday(cls.code, "")
+    }
+
+    fun stepTodayOlder() {
+        val state = _uiState.value
+        val cls = state.selectedClass ?: return
+        val serverToday = state.todayData?.today?.takeIf { it.isNotBlank() } ?: manilaTodayKey()
+        val currentDate = state.selectedTodayDate.ifBlank {
+            state.todayData?.date?.takeIf { it.isNotBlank() } ?: serverToday
+        }
+        val olderDate = state.recordedClassDates.firstOrNull { it < currentDate } ?: return
+        loadToday(cls.code, olderDate)
+    }
+
+    fun stepTodayNewer() {
+        val state = _uiState.value
+        val cls = state.selectedClass ?: return
+        val serverToday = state.todayData?.today?.takeIf { it.isNotBlank() } ?: manilaTodayKey()
+        val currentDate = state.selectedTodayDate.ifBlank {
+            state.todayData?.date?.takeIf { it.isNotBlank() } ?: serverToday
+        }
+        if (currentDate >= serverToday) return
+        val newerRecorded = state.recordedClassDates
+            .filter { it > currentDate && it < serverToday }
+            .minOrNull()
+        val target = newerRecorded ?: ""
+        loadToday(cls.code, target)
+    }
+
+    fun loadToday(code: String, date: String = _uiState.value.selectedTodayDate) {
         val token = _uiState.value.session.token
         if (token.isBlank()) return
-        _uiState.update { it.copy(isLoadingToday = true, todayError = null) }
+
+        val requested = date.trim()
+        val currentManilaToday = _uiState.value.todayData?.today?.takeIf { it.isNotBlank() } ?: manilaTodayKey()
+        if (requested.isNotBlank() && requested > currentManilaToday) {
+            _feedbackEvents.tryEmit(FeedbackType.Error)
+            _uiState.update { it.copy(todayError = "Future dates are not allowed.") }
+            return
+        }
+        val normalizedRequest = if (requested == currentManilaToday) "" else requested
+
+        _uiState.update {
+            it.copy(
+                selectedTodayDate = normalizedRequest,
+                isLoadingToday = true,
+                todayError = null
+            )
+        }
         viewModelScope.launch {
-            when (val res = api.today(token, code)) {
+            when (val res = api.today(token, code, normalizedRequest.ifBlank { null })) {
                 is ApiCallResult.Failure -> {
                     _uiState.update { it.copy(isLoadingToday = false, todayError = res.message) }
                 }
@@ -331,7 +395,42 @@ class TeacherViewModel(
                         preferencesRepository.clearSession()
                         _uiState.update { it.copy(isLoadingToday = false, loginError = data.msg) }
                     } else if (data.ok) {
-                        _uiState.update { it.copy(isLoadingToday = false, todayData = data) }
+                        val serverToday = data.today.ifBlank { manilaTodayKey() }
+                        val resolvedDate = data.date.ifBlank { normalizedRequest.ifBlank { serverToday } }
+                        val finalSelected = if (resolvedDate == serverToday) "" else resolvedDate
+                        val datesFromResponse = data.resolvedDates
+                            .filter { it <= serverToday }
+
+                        _uiState.update { current ->
+                            current.copy(
+                                isLoadingToday = false,
+                                selectedTodayDate = finalSelected,
+                                recordedClassDates = if (datesFromResponse.isNotEmpty()) {
+                                    datesFromResponse
+                                } else {
+                                    current.recordedClassDates
+                                },
+                                todayData = data
+                            )
+                        }
+
+                        if (datesFromResponse.isEmpty() && _uiState.value.recordedClassDates.isEmpty()) {
+                            when (val datesRes = api.reportDates(token, code)) {
+                                is ApiCallResult.Success -> {
+                                    if (datesRes.data.ok) {
+                                        val cleanDates = datesRes.data.dates
+                                            .map { it.trim() }
+                                            .filter { it.isNotBlank() && it <= serverToday }
+                                            .distinct()
+                                            .sortedDescending()
+                                        if (cleanDates.isNotEmpty()) {
+                                            _uiState.update { it.copy(recordedClassDates = cleanDates) }
+                                        }
+                                    }
+                                }
+                                is ApiCallResult.Failure -> Unit
+                            }
+                        }
                     } else {
                         _uiState.update {
                             it.copy(isLoadingToday = false, todayError = data.msg ?: "Could not load today's attendance.")
@@ -346,9 +445,18 @@ class TeacherViewModel(
         val token = _uiState.value.session.token
         val cls = _uiState.value.selectedClass ?: return
         if (token.isBlank()) return
-        _uiState.update { it.copy(markingStudentId = studentId) }
+
+        val targetDate = _uiState.value.selectedTodayDate.trim().ifBlank { null }
+        val currentManilaToday = _uiState.value.todayData?.today?.takeIf { it.isNotBlank() } ?: manilaTodayKey()
+        if (targetDate != null && targetDate > currentManilaToday) {
+            _feedbackEvents.tryEmit(FeedbackType.Error)
+            _uiState.update { it.copy(todayError = "Future dates are not allowed.") }
+            return
+        }
+
+        _uiState.update { it.copy(markingStudentId = studentId, todayError = null) }
         viewModelScope.launch {
-            when (val res = api.manualMark(token, cls.code, studentId)) {
+            when (val res = api.manualMark(token, cls.code, studentId, targetDate)) {
                 is ApiCallResult.Failure -> {
                     _uiState.update { it.copy(markingStudentId = null, todayError = res.message) }
                 }
@@ -356,13 +464,20 @@ class TeacherViewModel(
                     _uiState.update { it.copy(markingStudentId = null) }
                     if (res.data.ok) {
                         _feedbackEvents.tryEmit(FeedbackType.Success)
-                        loadToday(cls.code)
+                        loadToday(cls.code, _uiState.value.selectedTodayDate)
                     } else {
+                        _feedbackEvents.tryEmit(FeedbackType.Error)
                         _uiState.update { it.copy(todayError = res.data.msg ?: "Could not mark student.") }
                     }
                 }
             }
         }
+    }
+
+    private fun manilaTodayKey(): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("Asia/Manila")
+        return sdf.format(Date())
     }
 
     fun loadRoster(code: String) {

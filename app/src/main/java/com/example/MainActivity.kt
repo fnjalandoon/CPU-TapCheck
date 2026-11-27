@@ -102,6 +102,10 @@ class MainActivity : ComponentActivity() {
                             teacherViewModel.loadToday(code)
                         }
                     },
+                    onSelectTodayDate = teacherViewModel::selectTodayDate,
+                    onResetTodayToCurrent = teacherViewModel::resetTodayToCurrent,
+                    onStepTodayOlder = teacherViewModel::stepTodayOlder,
+                    onStepTodayNewer = teacherViewModel::stepTodayNewer,
                     onManualMark = teacherViewModel::manualMarkPresent,
                     onRefreshRoster = {
                         teacherViewModel.uiState.value.selectedClass?.code?.let { code ->

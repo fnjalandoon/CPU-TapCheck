@@ -88,4 +88,28 @@ class AttendanceResponseMappingTest {
             ) is CheckInOutcome.NotFound
         )
     }
+
+    @Test
+    fun `TodayResponse resolves and sorts recorded dates descending`() {
+        val resp = com.example.data.TodayResponse(
+            ok = true,
+            dates = listOf("2026-11-20", "2026-11-26", "2026-11-20", "2026-11-24")
+        )
+        assertEquals(listOf("2026-11-26", "2026-11-24", "2026-11-20"), resp.resolvedDates)
+
+        val fallbackResp = com.example.data.TodayResponse(
+            ok = true,
+            recordedDates = listOf("2026-11-17", "2026-11-19")
+        )
+        assertEquals(listOf("2026-11-19", "2026-11-17"), fallbackResp.resolvedDates)
+    }
+
+    @Test
+    fun `TodayDateHelpers UTC round-trip preserves exact calendar date`() {
+        val key = "2026-11-24"
+        val utcMillis = com.example.ui.teacher.TodayDateHelpers.dateKeyToUtcMillis(key)
+        assertTrue(utcMillis != null)
+        assertEquals(key, com.example.ui.teacher.TodayDateHelpers.utcMillisToDateKey(utcMillis!!))
+        assertEquals("Nov 24, 2026", com.example.ui.teacher.TodayDateHelpers.formatShortDate(key))
+    }
 }

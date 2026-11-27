@@ -73,11 +73,27 @@ class TeacherApiClient(
             moshi.adapter(SimpleApiResponse::class.java)
         )
 
-    suspend fun today(token: String, code: String): ApiCallResult<TodayResponse> =
+    suspend fun today(
+        token: String,
+        code: String,
+        date: String? = null
+    ): ApiCallResult<TodayResponse> =
         post(
-            PostClassCodeRequest(action = "today", token = token, code = code),
+            PostClassCodeRequest(
+                action = "today",
+                token = token,
+                code = code,
+                date = date?.takeIf { it.isNotBlank() }
+            ),
             moshi.adapter(PostClassCodeRequest::class.java),
             moshi.adapter(TodayResponse::class.java)
+        )
+
+    suspend fun reportDates(token: String, code: String): ApiCallResult<ReportDatesResponse> =
+        post(
+            PostClassCodeRequest(action = "report", token = token, code = code),
+            moshi.adapter(PostClassCodeRequest::class.java),
+            moshi.adapter(ReportDatesResponse::class.java)
         )
 
     suspend fun totals(token: String, code: String): ApiCallResult<TotalsResponse> =
@@ -90,10 +106,16 @@ class TeacherApiClient(
     suspend fun manualMark(
         token: String,
         code: String,
-        studentId: String
+        studentId: String,
+        date: String? = null
     ): ApiCallResult<CheckInResponse> =
         post(
-            PostManualMarkRequest(token = token, code = code, id = studentId),
+            PostManualMarkRequest(
+                token = token,
+                code = code,
+                id = studentId,
+                date = date?.takeIf { it.isNotBlank() }
+            ),
             moshi.adapter(PostManualMarkRequest::class.java),
             moshi.adapter(CheckInResponse::class.java)
         )
